@@ -1,0 +1,110 @@
+Yes. From scratch, do it like this.
+
+1. Create vLLM folder
+
+sudo mkdir -p /home/vllm/models
+sudo mkdir -p /home/vllm/logs
+sudo chown -R $USER:$USER /home/vllm
+cd /home/vllm
+
+2. Create compose.yml
+
+services:
+  vllm-gpt-oss:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-gpt-oss
+    runtime: nvidia
+    ipc: host
+    ports:
+      - "8000:8000"
+    volumes:
+      - /home/vllm/models:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+    command: >
+      --model openai/gpt-oss-20b
+      --served-model-name gpt-oss
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization 0.90
+      --max-model-len 8192
+
+vLLM’s official Docker image is vllm/vllm-openai, and it provides an OpenAI-compatible API server. 
+
+3. Start it
+
+docker compose up -d
+
+First run downloads the model into:
+
+/home/vllm/models
+
+Next runs reuse it.
+
+4. Check logs
+
+docker logs -f vllm-gpt-oss
+
+5. Test API
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-oss",
+    "messages": [
+      {"role": "user", "content": "Hello"}
+    ],
+    "max_tokens": 100
+  }'
+
+Your RAG container should call:
+
+http://vllm-gpt-oss:8000/v1/chat/completions
+
+or, from outside Docker:
+
+http://SERVER_IP:8000/v1/chat/completions
+
+Add another model later for testing
+
+Edit compose.yml and add another service, for example Granite AWQ/GPTQ:
+
+vllm-granite:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-granite
+    runtime: nvidia
+    ipc: host
+    ports:
+      - "8000:8000"
+    volumes:
+      - /home/vllm/models:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+    command: >
+      --model YOUR-GRANITE-QUANTIZED-AWQ-OR-GPTQ-REPO
+      --served-model-name granite
+      --host 0.0.0.0
+      --port 8000
+      --quantization awq
+      --gpu-memory-utilization 0.90
+      --max-model-len 8192
+
+Do not run both at the same time on the same port/GPU.
+
+Switch models like this:
+
+docker compose stop vllm-gpt-oss
+docker compose up -d vllm-granite
+
+Switch back:
+
+docker compose stop vllm-granite
+docker compose up -d vllm-gpt-oss
+
+Main idea:
+
+/home/vllm/models = persistent model cache
+vllm/vllm-openai:latest = same Docker image for all models
+compose.yml = your model configs
+one active vLLM model container at a time
+RAG calls the active vLLM API
