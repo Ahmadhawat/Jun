@@ -1,0 +1,517 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+import json
+import requests
+import tiktoken
+
+from src.pipeline.Context import Context
+from src.search_steps.impls.prompting.CpromptingABS import Prompting
+
+
+def count_gpt_oss_tokens(text: str) -> int:
+    """
+    Calculate how many input tokens a string uses for GPT-OSS models.
+    """
+    encoder = tiktoken.get_encoding("o200k_harmony")
+    return len(
+        encoder.encode(
+            text or "",
+            disallowed_special=(),
+        )
+    )
+
+
+def build_prompt(
+    *,
+    intent: str,
+    question: str,
+    documents: List[Dict[str, Any]],
+    system_prom: str,
+    instructions_prom: str,
+    link_quelle: str,
+    chat_history: str = "",
+    needs_retrieval: bool = True,
+) -> str:
+    context = ""
+
+    for i, doc in enumerate(documents, 1):
+        source = str(doc.get("source", "")).replace("\\", "/")
+        source = source.replace(
+            "/root/chat-Hilfe/CARDPT102/Help/content/",
+            link_quelle,
+        )
+
+        context += f"""
+[DOCUMENT {i}]
+SOURCE: {source}
+CONTENT:
+{doc["content"]}
+---
+"""
+
+    if not context.strip():
+        context = "No retrieved documents."
+
+    history_section = chat_history if chat_history.strip() else "No previous conversation."
+
+    return f"""
+{system_prom}
+
+---
+INTENT:
+{intent}
+
+---
+NEEDS_RETRIEVAL:
+{needs_retrieval}
+
+---
+CHAT HISTORY:
+{history_section}
+
+---
+RETRIEVED DOCUMENTS:
+{context}
+
+---
+LATEST USER REQUEST:
+{question}
+
+---
+INSTRUCTIONS:
+{instructions_prom}
+
+---
+ANSWER:
+""".strip()
+
+
+def query_ollama(
+    url: str,
+    model: str,
+    prompt: str,
+    temperature: float = 0.2,
+    context_window: int = 8192,
+    max_tokens: int = 400,
+    timeout: int = 90,
+) -> str:
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "num_ctx": context_window,
+            "num_predict": max_tokens,
+        },
+    }
+
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+
+    return resp.json()["response"]
+
+
+class PromptingV2(Prompting):
+    name = "PromptingV2"
+
+    def _source_path(self, res: Dict[str, Any]) -> str:
+        return (
+            res.get("html_real_path")
+            or res.get("txt_path")
+            or res.get("chunk_path")
+            or res.get("chunk_name")
+            or f"chunk_id-{res.get('chunk_id')}"
+        )
+
+    def _score(self, res: Dict[str, Any]) -> float:
+        score = (
+            res.get("scores", {}).get("blended")
+            or res.get("scores", {}).get("ce")
+            or res.get("scores", {}).get("score")
+            or 0.0
+        )
+
+        try:
+            return float(score)
+        except Exception:
+            return 0.0
+
+    def _make_doc_from_res(
+        self,
+        res: Dict[str, Any],
+        *,
+        use_full_file: bool,
+    ) -> Optional[Dict[str, Any]]:
+        full_content = str(res.get("chunk_text_content", "") or "").strip()
+        chunk_content = str(res.get("chunk_text", "") or "").strip()
+
+        if use_full_file and full_content:
+            content = full_content
+        else:
+            content = chunk_content or full_content
+
+        if not content:
+            return None
+
+        source_path = self._source_path(res)
+
+        return {
+            "chunk_id": res.get("chunk_id"),
+            "chunk_name": res.get("chunk_name"),
+            "source": source_path,
+            "content": content,
+            "scores": res.get("scores", {}),
+            "_use_full_file": use_full_file and bool(full_content),
+            "_full_tokens": count_gpt_oss_tokens(full_content) if full_content else 0,
+            "_chunk_tokens": count_gpt_oss_tokens(chunk_content) if chunk_content else 0,
+        }
+
+    def _select_documents_under_budget(
+        self,
+        *,
+        reranked: List[Dict[str, Any]],
+        top_k: int,
+        min_docs: int,
+        max_prompt_tokens: int,
+        reserved_answer_tokens: int,
+        intent: str,
+        query_text: str,
+        sys_prom: str,
+        instra_prompt: str,
+        link: str,
+        chat_history: str,
+        needs_retrieval: bool,
+        log,
+    ) -> List[Dict[str, Any]]:
+
+        def prompt_token_count(docs: List[Dict[str, Any]]) -> int:
+            prompt = build_prompt(
+                intent=intent,
+                question=query_text,
+                documents=docs,
+                system_prom=sys_prom,
+                instructions_prom=instra_prompt,
+                link_quelle=link,
+                chat_history=chat_history,
+                needs_retrieval=needs_retrieval,
+            )
+            return count_gpt_oss_tokens(prompt)
+
+        # --------------------------------------------------------------
+        # Step 1: take best chunk per original source from top results.
+        # --------------------------------------------------------------
+        best_by_source: Dict[str, tuple[float, Dict[str, Any]]] = {}
+
+        for res in reranked[:top_k]:
+            source_path = self._source_path(res)
+            score = self._score(res)
+
+            current = best_by_source.get(source_path)
+
+            if current is None or score > current[0]:
+                best_by_source[source_path] = (score, res)
+
+        best_results = [
+            res
+            for _score, res in sorted(
+                best_by_source.values(),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+        ]
+
+        docs: List[Dict[str, Any]] = []
+
+        # --------------------------------------------------------------
+        # Step 2: first try full original files for the first 10 sources.
+        # --------------------------------------------------------------
+        for res in best_results[:min_docs]:
+            doc = self._make_doc_from_res(res, use_full_file=True)
+            if doc:
+                docs.append(doc)
+
+        # --------------------------------------------------------------
+        # Step 3: if too large, replace biggest full files with chunks.
+        # --------------------------------------------------------------
+        while docs and prompt_token_count(docs) + reserved_answer_tokens > max_prompt_tokens:
+            full_docs = [doc for doc in docs if doc.get("_use_full_file")]
+
+            if not full_docs:
+                break
+
+            largest_doc = max(
+                full_docs,
+                key=lambda doc: doc.get("_full_tokens", 0),
+            )
+
+            idx = docs.index(largest_doc)
+
+            original_res = None
+            for res in best_results:
+                if self._source_path(res) == largest_doc["source"]:
+                    original_res = res
+                    break
+
+            if original_res is None:
+                docs.pop(idx)
+                continue
+
+            replacement = self._make_doc_from_res(
+                original_res,
+                use_full_file=False,
+            )
+
+            if replacement:
+                docs[idx] = replacement
+            else:
+                docs.pop(idx)
+
+        # --------------------------------------------------------------
+        # Step 4: guarantee at least 10 docs/chunks if possible.
+        # --------------------------------------------------------------
+        if len(docs) < min_docs:
+            used_sources = {doc["source"] for doc in docs}
+
+            for res in reranked:
+                doc = self._make_doc_from_res(res, use_full_file=False)
+                if not doc:
+                    continue
+
+                if doc["source"] in used_sources:
+                    continue
+
+                trial_docs = docs + [doc]
+
+                if prompt_token_count(trial_docs) + reserved_answer_tokens <= max_prompt_tokens:
+                    docs.append(doc)
+                    used_sources.add(doc["source"])
+
+                if len(docs) >= min_docs:
+                    break
+
+        # --------------------------------------------------------------
+        # Step 5: after 10, add more full files if possible.
+        # If full file is too big, try its chunk.
+        # --------------------------------------------------------------
+        used_sources = {doc["source"] for doc in docs}
+
+        for res in best_results[min_docs:]:
+            source_path = self._source_path(res)
+
+            if source_path in used_sources:
+                continue
+
+            full_doc = self._make_doc_from_res(res, use_full_file=True)
+
+            if full_doc:
+                trial_docs = docs + [full_doc]
+
+                if prompt_token_count(trial_docs) + reserved_answer_tokens <= max_prompt_tokens:
+                    docs.append(full_doc)
+                    used_sources.add(source_path)
+                    continue
+
+            chunk_doc = self._make_doc_from_res(res, use_full_file=False)
+
+            if chunk_doc:
+                trial_docs = docs + [chunk_doc]
+
+                if prompt_token_count(trial_docs) + reserved_answer_tokens <= max_prompt_tokens:
+                    docs.append(chunk_doc)
+                    used_sources.add(source_path)
+
+        final_tokens = prompt_token_count(docs)
+
+        log.info(
+            "Prepared %d documents. Prompt tokens=%d, reserved answer tokens=%d, total planned=%d.",
+            len(docs),
+            final_tokens,
+            reserved_answer_tokens,
+            final_tokens + reserved_answer_tokens,
+        )
+
+        return docs
+
+    def run(self, ctx: Context) -> None:
+        log = ctx.log.getChild(self.name)
+        cfg = ctx.cfg
+
+        query_cfg = cfg.get("query", {}) or {}
+        prompting_cfg = cfg.get("Prompting", {}) or {}
+        io_cfg = cfg.get("io", {}) or {}
+        paths = cfg.get("paths", {}) or {}
+
+        request_state = cfg.get("_request", {}) or {}
+
+        intent = str(
+            request_state.get("intent")
+            or ctx.artifacts.get("intent")
+            or "rag_search"
+        )
+
+        needs_retrieval = bool(
+            request_state.get(
+                "needs_retrieval",
+                ctx.artifacts.get("needs_retrieval", True),
+            )
+        )
+
+        chat_history = str(query_cfg.get("chat_history", "") or "")
+
+        api_url: Optional[str] = query_cfg.get("API_URL")
+        model: Optional[str] = query_cfg.get("MODEL_NAME")
+
+        temperature: float = float(prompting_cfg.get("temperature", 0.0))
+        max_token: int = int(prompting_cfg.get("Answer_max_tokens", 400))
+        time_out: int = int(prompting_cfg.get("time_out2", 90))
+        ctx_num: int = int(prompting_cfg.get("context_window", 8192))
+
+        top_k: int = int(prompting_cfg.get("taked_chunks", 20))
+        min_docs: int = int(prompting_cfg.get("minimum_documents", 10))
+        max_prompt_tokens: int = int(prompting_cfg.get("max_prompt_tokens", 12000))
+
+        sys_prom = prompting_cfg.get("system_prompt", "")
+        instra_prompt = prompting_cfg.get("Instructions", "")
+
+        store_prompt_payload = bool(io_cfg.get("store_prompt_payload", False))
+
+        payload_path = Path(
+            paths.get(
+                "payload_path",
+                "./Daten/workspace/results/payload.txt",
+            )
+        )
+
+        link = paths.get(
+            "Link",
+            "file:////ibt-root.ibtad.ibtnet.de/pub_entw/CARDPT102/Help/content/",
+        )
+
+        query_text = (
+            request_state.get("final_question")
+            or ctx.artifacts.get("final_question")
+            or ctx.artifacts.get("raw_query")
+            or query_cfg.get("text", "")
+        )
+
+        query_text = str(query_text or "").strip()
+
+        if not query_text:
+            log.warning("No query text found for prompting.")
+            ctx.artifacts["final_answer"] = "I did not receive a question."
+            return
+
+        reranked = list(request_state.get("reranked_results", []) or [])
+
+        if not reranked:
+            reranked = list(ctx.artifacts.get("gated_reranked_results", []) or [])
+
+        if not reranked:
+            reranked = list(ctx.artifacts.get("reranked_results", []) or [])
+
+        if not reranked:
+            reranked_json = (
+                ctx.artifacts.get("reranked_results_path")
+                or paths.get("reranked_results_path")
+            )
+
+            if reranked_json and Path(reranked_json).exists():
+                try:
+                    data = json.loads(
+                        Path(reranked_json).read_text(encoding="utf-8")
+                    )
+                    reranked = list(data.get("results", []))
+                    log.info("Loaded reranked results from file fallback.")
+                except Exception as e:
+                    log.warning("Failed to read reranked file fallback: %s", e)
+
+        if needs_retrieval and not reranked:
+            message = "I could not find an answer for that in the available documentation."
+            ctx.artifacts["final_answer"] = message
+            log.warning("No reranked results available for RAG prompting.")
+            return
+
+        if needs_retrieval:
+            docs = self._select_documents_under_budget(
+                reranked=reranked,
+                top_k=top_k,
+                min_docs=min_docs,
+                max_prompt_tokens=max_prompt_tokens,
+                reserved_answer_tokens=max_token,
+                intent=intent,
+                query_text=query_text,
+                sys_prom=sys_prom,
+                instra_prompt=instra_prompt,
+                link=link,
+                chat_history=chat_history,
+                needs_retrieval=needs_retrieval,
+                log=log,
+            )
+
+            if not docs:
+                message = "I could not find an answer for that in the available documentation."
+                ctx.artifacts["final_answer"] = message
+                log.warning("No readable documents available for final prompting.")
+                return
+
+        else:
+            docs = []
+            log.info("Prompting without retrieval documents. intent=%s", intent)
+
+        prompt = build_prompt(
+            intent=intent,
+            question=query_text,
+            documents=docs,
+            system_prom=sys_prom,
+            instructions_prom=instra_prompt,
+            link_quelle=link,
+            chat_history=chat_history,
+            needs_retrieval=needs_retrieval,
+        )
+
+        prompt_tokens = count_gpt_oss_tokens(prompt)
+        ctx.artifacts["prompt_tokens"] = prompt_tokens
+        ctx.artifacts["selected_documents_count"] = len(docs)
+
+        if prompt_tokens + max_token > max_prompt_tokens:
+            log.warning(
+                "Prompt still exceeds budget. prompt_tokens=%d answer_tokens=%d budget=%d",
+                prompt_tokens,
+                max_token,
+                max_prompt_tokens,
+            )
+
+        if store_prompt_payload:
+            try:
+                payload_path.parent.mkdir(parents=True, exist_ok=True)
+                payload_path.write_text(prompt, encoding="utf-8", newline="\n")
+                ctx.artifacts["payload_path"] = str(payload_path)
+            except Exception as e:
+                log.warning("Failed to store prompt payload: %s", e)
+
+        if not api_url or not model:
+            message = "LLM API URL or model name is missing."
+            ctx.artifacts["final_answer"] = message
+            log.error(message)
+            return
+
+        try:
+            answer = query_ollama(
+                url=api_url,
+                model=model,
+                prompt=prompt,
+                temperature=temperature,
+                context_window=max(ctx_num, max_prompt_tokens + max_token),
+                max_tokens=max_token,
+                timeout=time_out,
+            )
+
+        except Exception as e:
+            log.error("LLM request failed: %s", e)
+            ctx.artifacts["final_answer"] = "The answer generation request failed."
+            return
+
+        ctx.artifacts["final_answer"] = answer
